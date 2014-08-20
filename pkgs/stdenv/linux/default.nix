@@ -71,7 +71,7 @@ rec {
   # the bootstrap.  In all stages, we build an stdenv and the package
   # set that can be built with this new stdenv.
   stageFun =
-    {gcc, finalPkgs, keepPkgs ? [], extraAttrs ? {}, overrides ? (pkgs: {}), extraPath ? []}:
+    {gcc, finalPkgs, name, keepPkgs ? [], extraAttrs ? {}, overrides ? (pkgs: {}), extraPath ? []}:
 
     let
     thisStdenv = import ../generic {
@@ -102,7 +102,8 @@ rec {
     };
 
     keptPkgs = keepAttrs keepPkgs thisPkgs;
-    in  { stdenv = thisStdenv;
+    in  { name = name;
+          stdenv = thisStdenv;
           pkgs = keptPkgs;
           finalPkgs = finalPkgs keptPkgs; };
 
@@ -128,6 +129,7 @@ rec {
   # contains a downloaded Glibc that will be good enough to use in our
   # first GCC.
   stage0 = stageFun {
+    name = "stage0";
     gcc = "/no-such-path";
 
     overrides = pkgs: {
@@ -159,6 +161,7 @@ rec {
   # simply re-export those packages in the middle stage(s) using the
   # overrides attribute and the inherit syntax.
   stage1 = stageFun {
+    name = "stage1";
     gcc = wrapGCC {
       gcc = bootstrapTools;
       libc = stage0.pkgs.glibc;
@@ -179,6 +182,7 @@ rec {
   # 3) 2nd stdenv that contains our own rebuilt binutils and this is
   #    used later for compiling our own Glibc.
   stage2 = stageFun {
+    name = "stage2";
     gcc = wrapGCC {
       gcc = bootstrapTools;
       libc = stage1.pkgs.glibc;
@@ -200,6 +204,7 @@ rec {
   #    one uses our own rebuilt Glibc.  It still uses the binutils
   #    from stage1 and the rest from bootstrap-tools, including GCC.
   stage3 = stageFun {
+    name = "stage3";
     gcc = wrapGCC {
       gcc = bootstrapTools;
       libc = stage2.pkgs.glibc;
@@ -219,6 +224,7 @@ rec {
       isl = pkgs.isl.override { stdenv = pkgs.makeStaticLibraries pkgs.stdenv; };
       cloog = pkgs.cloog.override { stdenv = pkgs.makeStaticLibraries pkgs.stdenv; };
       ppl = pkgs.ppl.override { stdenv = pkgs.makeStaticLibraries pkgs.stdenv; };
+      gcc_unwrapped = pkgs.gcc.gcc;
     };
 
     extraAttrs = {
@@ -227,7 +233,7 @@ rec {
 
     extraPath = [ stage2.pkgs.paxctl ];
 
-    keepPkgs = [ "binutils" "gcc" "glibc" "gettext" "gmp" "gnum4" "perl" "xz" "zlib" ];
+    keepPkgs = [ "binutils" "gcc" "gcc_unwrapped" "glibc" "gettext" "gmp" "gnum4" "perl" "xz" "zlib" ];
     finalPkgs = pkgs: [ pkgs.gcc.gcc pkgs.glibc pkgs.zlib ];
   };
 
@@ -235,6 +241,7 @@ rec {
   # 5) Construct a fourth stdenv, this one uses the new GCC.  Some
   #    tools (e.g. coreutils) are still from the bootstrap tools.
   stage4 = stageFun {
+    name = "stage4";
     gcc = wrapGCC {
       gcc = stage3.pkgs.gcc.gcc;
       libc = stage3.pkgs.glibc;
@@ -328,43 +335,53 @@ rec {
       '';
   };
 
-  graph = deriv: import "${createGraph deriv}/list.nix";
+  getDependencies = deriv: import "${createGraph deriv}/list.nix";
 
-  testfun = finalPkg: stage0.stdenv.mkDerivation {
-    name = "stdenv-pkg-checker";
+  stages = [stage0 stage1 stage2 stage3 stage4];
+  allFinalPkgs = lib.concatMap (x: x.finalPkgs) stages;
+  inFinalOutPaths = let allFinalOutPaths = map (x: x.outPath) allFinalPkgs;
+                    in n: lib.any (lib.eqStrings n) allFinalOutPaths;
+
+  findOrigin = toFind:
+    let cands = lib.flip lib.concatMap stages (stage:
+      lib.flip lib.mapAttrsToList stage.pkgs (pkgName: drv:
+          if lib.eqStrings toFind drv.outPath
+          then stage.name + "." + pkgName
+          else ""));
+        found = lib.remove "" cands;
+    in if found == []
+       then "Origin of ${toFind} is not known"
+       else "Origin of ${toFind} is ${lib.head found}";
+
+
+  ensureDependenciesInFinalPkgs = pkg: stage0.stdenv.mkDerivation {
+    name = "stdenv-pkg-ensuredeps";
     buildCommand =
-    let depGraph = lib.showVal (graph finalPkg);
-    in builtins.trace depGraph "exit 1";
-  };
-
-  stdenvLinuxCheckerv2 = testfun (builtins.head stage2.finalPkgs);
-
-  stdenvLinuxChecker = stage0.stdenv.mkDerivation {
-    name = "stdenv-checker";
-    exportReferencesGraph = [ "stdenvLinux.deps" stdenvLinuxCandidate ];
-    allowedOuts = map (x: x.outPath)
-      (stage0.finalPkgs ++ stage1.finalPkgs ++ stage2.finalPkgs ++ stage3.finalPkgs ++ stage4.finalPkgs);
-
-
-    buildCommand = let
-      test = import "${createGraph stdenvLinuxCandidate}/list.nix";
-    in ''
-      ls -ld ${builtins.head test}
-
-      grep '^/' stdenvLinux.deps | sort | uniq | grep -v "^${stdenvLinuxCandidate}" >stdenvLinux.outPkgs
-
+    let dependencies = getDependencies pkg;
+        badDeps = lib.filter (x: ! inFinalOutPaths x) dependencies;
+    in if badDeps == [] then "mkdir $out" else let badDep = lib.head badDeps; in ''
+      echo >&2
+      echo >&2
+      echo >&2
+      echo >&2 "${pkg} depends on ${badDep}"
+      echo >&2
+      echo >&2 "${pkg} is part of the stdenv being built, BUT"
+      echo >&2 "${badDep} is not allowed to be in the closure of the stdenv"
+      echo >&2
+      echo >&2 "${findOrigin pkg}"
+      echo >&2 "${findOrigin badDep}"
+      echo >&2
+      echo >&2
+      echo >&2
       exit 1
-
-      for pkg in $(cat stdenvLinux.outPkgs); do
-        if ! grep -q "^$pkg$" allowedOuts; then
-          echo >&2 "$pkg is not in the allowed dependencies in pkgs/stdenv/linux/default.nix"
-          exit 1
-        fi
-      done
-      mkdir $out
     '';
   };
 
+  stdenvLinuxCheckerv2 = lib.overrideDerivation
+    (stage0.stdenv.mkDerivation {
+       name = "stdenv-checker";
+       buildCommand = "mkdir $out"; })
+    (_: { depChecks = map (x: ensureDependenciesInFinalPkgs x) allFinalPkgs; });
 
   stdenvLinux = lib.overrideDerivation stdenvLinuxCandidate
                 (_: { runThisCheck = stdenvLinuxCheckerv2; });
