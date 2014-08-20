@@ -65,7 +65,6 @@ rec {
     langCC = true;
   };
 
-  # Keep only the attributes from "set" that is mentioned in "list".
   keepAttrs = list: set: lib.filterAttrs (key: _value: lib.elem key list) set;
 
   # This function builds the various standard environments used during
@@ -101,6 +100,7 @@ rec {
       inherit system platform;
       bootStdenv = thisStdenv;
     };
+
     keptPkgs = keepAttrs keepPkgs thisPkgs;
     in  { stdenv = thisStdenv;
           pkgs = keptPkgs;
@@ -258,7 +258,7 @@ rec {
 
     keepPkgs = [ "acl" "attr" "bash" "binutils" "bzip2" "coreutils" "diffutils" "ed" "findutils"
                  "gawk" "gcc" "glibc" "gnugrep" "gnumake" "gnupatch" "gnused" "gnutar" "gzip"
-                 "libsigsegv" "patch" "patchelf" "paxctl" "pcre" "xz" "zlib" ];
+                 "libsigsegv" "patch" "patchelf" "paxctl" "pcre" "xz" "zlib" "mc" ];
     # TODO: this zlib here is a bug, but we want to keep semantics in this commit!
     finalPkgs = pkgs: with pkgs;
                 [ patchelf libsigsegv xz zlib ed findutils coreutils gnugrep
@@ -310,15 +310,50 @@ rec {
     };
   };
 
+  # plan:
+  #   - checker ami kap [stage0, stage1, ...]
+  #   - buildeli sorban a final-eket es nezi, hogy a grafban szerepel-e nem final
+  #   - es ha igen, akkor lookuplni probalja a stagek sorrendjeben a keepekben
+  #     az error message-ert, de nem biztos hogy talal
+  #   - stringosszehasonlito ami mindket iranyba fertoz es ezert context free
+
+  createGraph = deriv: stage0.stdenv.mkDerivation {
+    name = "graph-" + deriv.name;
+    exportReferencesGraph = [ "list.in" deriv ];
+    buildCommand = ''
+      mkdir $out
+      ( echo '['
+        grep '^/' list.in | sort | uniq | grep -v ${deriv.outPath} | sed 's/^/"/;s/$/"/;'
+        echo ']' ) >$out/list.nix
+      '';
+  };
+
+  graph = deriv: import "${createGraph deriv}/list.nix";
+
+  testfun = finalPkg: stage0.stdenv.mkDerivation {
+    name = "stdenv-pkg-checker";
+    buildCommand =
+    let depGraph = lib.showVal (graph finalPkg);
+    in builtins.trace depGraph "exit 1";
+  };
+
+  stdenvLinuxCheckerv2 = testfun (builtins.head stage2.finalPkgs);
 
   stdenvLinuxChecker = stage0.stdenv.mkDerivation {
     name = "stdenv-checker";
     exportReferencesGraph = [ "stdenvLinux.deps" stdenvLinuxCandidate ];
     allowedOuts = map (x: x.outPath)
       (stage0.finalPkgs ++ stage1.finalPkgs ++ stage2.finalPkgs ++ stage3.finalPkgs ++ stage4.finalPkgs);
-    buildCommand = ''
-      for i in $allowedOuts; do echo $i >>allowedOuts ; done
+
+
+    buildCommand = let
+      test = import "${createGraph stdenvLinuxCandidate}/list.nix";
+    in ''
+      ls -ld ${builtins.head test}
+
       grep '^/' stdenvLinux.deps | sort | uniq | grep -v "^${stdenvLinuxCandidate}" >stdenvLinux.outPkgs
+
+      exit 1
 
       for pkg in $(cat stdenvLinux.outPkgs); do
         if ! grep -q "^$pkg$" allowedOuts; then
@@ -332,5 +367,5 @@ rec {
 
 
   stdenvLinux = lib.overrideDerivation stdenvLinuxCandidate
-                (_: { runThisCheck = stdenvLinuxChecker; });
+                (_: { runThisCheck = stdenvLinuxCheckerv2; });
 }
