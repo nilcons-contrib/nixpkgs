@@ -35,8 +35,8 @@ rec {
   # The bootstrap process proceeds in several steps.
 
 
-  # 1) Create a standard environment by downloading pre-built binaries
-  # of coreutils, GCC, etc.
+  # First, create a standard environment by downloading pre-built
+  # binaries of coreutils, GCC, etc.
 
 
   # Download and unpack the bootstrap tools (coreutils, GCC, Glibc, ...).
@@ -46,7 +46,7 @@ rec {
     builder = bootstrapFiles.sh;
 
     args =
-      if system == "armv5tel-linux" || system == "armv6l-linux" 
+      if system == "armv5tel-linux" || system == "armv6l-linux"
         || system == "armv7l-linux"
       then [ ./scripts/unpack-bootstrap-tools-arm.sh ]
       else [ ./scripts/unpack-bootstrap-tools.sh ];
@@ -65,12 +65,14 @@ rec {
     langCC = true;
   };
 
+  # Keep only the attributes from "set" that is mentioned in "list".
+  keepAttrs = list: set: lib.filterAttrs (key: _value: lib.elem key list) set;
 
   # This function builds the various standard environments used during
   # the bootstrap.  In all stages, we build an stdenv and the package
   # set that can be built with this new stdenv.
   stageFun =
-    {gcc, extraAttrs ? {}, overrides ? (pkgs: {}), extraPath ? []}:
+    {gcc, finalPkgs, keepPkgs ? [], extraAttrs ? {}, overrides ? (pkgs: {}), extraPath ? []}:
 
     let
     thisStdenv = import ../generic {
@@ -99,7 +101,10 @@ rec {
       inherit system platform;
       bootStdenv = thisStdenv;
     };
-    in { stdenv = thisStdenv; pkgs = thisPkgs; };
+    keptPkgs = keepAttrs keepPkgs thisPkgs;
+    in  { stdenv = thisStdenv;
+          pkgs = keptPkgs;
+          finalPkgs = finalPkgs keptPkgs; };
 
 
   # A helper function to call gcc-wrapper.
@@ -114,8 +119,14 @@ rec {
     };
 
 
-  # Build a dummy stdenv with no GCC, but with a dummy Glibc that is
-  # good enough to compile our first GCC.
+  # For clarity, we only use the previous stage when specifying these
+  # stages.  So stageN should only ever have references for stage{N-1}.
+  # Also, we explicitly specify which packages we keep  around in each
+  # stage with the keepPkgs parameter.
+
+  # Build a dummy stdenv with no GCC, but with stage0.pkgs that
+  # contains a downloaded Glibc that will be good enough to use in our
+  # first GCC.
   stage0 = stageFun {
     gcc = "/no-such-path";
 
@@ -133,6 +144,9 @@ rec {
         '';
       };
     };
+
+    keepPkgs = [ "glibc" ];
+    finalPkgs = pkgs: [ ];
   };
 
 
@@ -140,8 +154,6 @@ rec {
   #    consists of bootstrap tools only, and a minimal Glibc to keep
   #    the GCC configure script happy.
   #
-  # For clarity, we only use the previous stage when specifying these
-  # stages.  So stageN should only ever have references for stage{N-1}.
   #
   # If we ever need to use a package from more than one stage back, we
   # simply re-export those packages in the middle stage(s) using the
@@ -154,10 +166,14 @@ rec {
       coreutils = bootstrapTools;
       name = "bootstrap-gcc-wrapper";
     };
+
     overrides = pkgs: {
       binutils = pkgs.binutils.override { gold = false; };
       inherit (stage0.pkgs) glibc;
     };
+
+    keepPkgs = [ "binutils" "glibc" "paxctl" "perl" ];
+    finalPkgs = pkgs: [ ];
   };
 
   # 3) 2nd stdenv that contains our own rebuilt binutils and this is
@@ -170,9 +186,13 @@ rec {
       coreutils = bootstrapTools;
       name = "bootstrap-gcc-wrapper";
     };
+
     overrides = pkgs: {
       inherit (stage1.pkgs) perl binutils paxctl;
     };
+
+    keepPkgs = [ "binutils" "glibc" "linuxHeaders" "paxctl" "perl" ];
+    finalPkgs = pkgs: [ pkgs.linuxHeaders ];
   };
 
 
@@ -187,6 +207,7 @@ rec {
       coreutils = bootstrapTools;
       name = "bootstrap-gcc-wrapper";
     };
+
     overrides = pkgs: {
       inherit (stage2.pkgs) binutils glibc perl;
       # Link GCC statically against GMP etc.  This makes sense because
@@ -199,10 +220,15 @@ rec {
       cloog = pkgs.cloog.override { stdenv = pkgs.makeStaticLibraries pkgs.stdenv; };
       ppl = pkgs.ppl.override { stdenv = pkgs.makeStaticLibraries pkgs.stdenv; };
     };
+
     extraAttrs = {
       glibc = stage2.pkgs.glibc;   # Required by gcc47 build
     };
+
     extraPath = [ stage2.pkgs.paxctl ];
+
+    keepPkgs = [ "binutils" "gcc" "glibc" "gettext" "gmp" "gnum4" "perl" "xz" "zlib" ];
+    finalPkgs = pkgs: [ pkgs.gcc.gcc pkgs.glibc pkgs.zlib ];
   };
 
 
@@ -216,10 +242,28 @@ rec {
       coreutils = bootstrapTools;
       name = "";
     };
+
     extraPath = [ stage3.pkgs.xz ];
+
     overrides = pkgs: {
+      gcc = (wrapGCC {
+        gcc = stage4.stdenv.gcc.gcc;
+        libc = stage4.pkgs.glibc;
+        inherit (stage4.pkgs) binutils coreutils;
+        name = "";
+      }).override { shell = stage4.pkgs.bash + "/bin/bash"; };
+
       inherit (stage3.pkgs) gettext gnum4 gmp perl glibc;
     };
+
+    keepPkgs = [ "acl" "attr" "bash" "binutils" "bzip2" "coreutils" "diffutils" "ed" "findutils"
+                 "gawk" "gcc" "glibc" "gnugrep" "gnumake" "gnupatch" "gnused" "gnutar" "gzip"
+                 "libsigsegv" "patch" "patchelf" "paxctl" "pcre" "xz" "zlib" ];
+    # TODO: this zlib here is a bug, but we want to keep semantics in this commit!
+    finalPkgs = pkgs: with pkgs;
+                [ patchelf libsigsegv xz zlib ed findutils coreutils gnugrep
+                  pcre gawk gnumake gcc binutils bash acl gnupatch gzip gnutar
+                  diffutils attr gnused paxctl bzip2 ];
   };
 
 
@@ -230,7 +274,7 @@ rec {
   #    When updating stdenvLinux, make sure that the result has no
   #    dependency (`nix-store -qR') on bootstrapTools or the
   #    first binutils built.
-  stdenvLinux = import ../generic rec {
+  stdenvLinuxCandidate = import ../generic rec {
     inherit system config;
 
     preHook =
@@ -245,15 +289,9 @@ rec {
       ((import ../common-path.nix) {pkgs = stage4.pkgs;})
       ++ [stage4.pkgs.patchelf stage4.pkgs.paxctl ];
 
-
     shell = stage4.pkgs.bash + "/bin/bash";
 
-    gcc = (wrapGCC {
-      gcc = stage4.stdenv.gcc.gcc;
-      libc = stage4.pkgs.glibc;
-      inherit (stage4.pkgs) binutils coreutils;
-      name = "";
-    }).override { inherit shell; };
+    gcc = stage4.pkgs.gcc;
 
     fetchurlBoot = stage4.stdenv.fetchurlBoot;
 
@@ -272,4 +310,27 @@ rec {
     };
   };
 
+
+  stdenvLinuxChecker = stage0.stdenv.mkDerivation {
+    name = "stdenv-checker";
+    exportReferencesGraph = [ "stdenvLinux.deps" stdenvLinuxCandidate ];
+    allowedOuts = map (x: x.outPath)
+      (stage0.finalPkgs ++ stage1.finalPkgs ++ stage2.finalPkgs ++ stage3.finalPkgs ++ stage4.finalPkgs);
+    buildCommand = ''
+      for i in $allowedOuts; do echo $i >>allowedOuts ; done
+      grep '^/' stdenvLinux.deps | sort | uniq | grep -v "^${stdenvLinuxCandidate}" >stdenvLinux.outPkgs
+
+      for pkg in $(cat stdenvLinux.outPkgs); do
+        if ! grep -q "^$pkg$" allowedOuts; then
+          echo >&2 "$pkg is not in the allowed dependencies in pkgs/stdenv/linux/default.nix"
+          exit 1
+        fi
+      done
+      mkdir $out
+    '';
+  };
+
+
+  stdenvLinux = lib.overrideDerivation stdenvLinuxCandidate
+                (_: { runThisCheck = stdenvLinuxChecker; });
 }
