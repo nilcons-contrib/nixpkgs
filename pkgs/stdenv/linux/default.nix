@@ -46,7 +46,7 @@ rec {
     builder = bootstrapFiles.sh;
 
     args =
-      if system == "armv5tel-linux" || system == "armv6l-linux" 
+      if system == "armv5tel-linux" || system == "armv6l-linux"
         || system == "armv7l-linux"
       then [ ./scripts/unpack-bootstrap-tools-arm.sh ]
       else [ ./scripts/unpack-bootstrap-tools.sh ];
@@ -113,6 +113,22 @@ rec {
       stdenv = stage0.stdenv;
     };
 
+  # Helpers for checking/enforcing run-time dependencies
+  checkAR = drv: ref:
+    if ref.drvAttrs ? allowedReferencesRec
+    then []
+    else throw ''
+      ${ref} can't be used in allowReferencesRec while defining ${drv},
+      because ${ref} itself doesn't use allowReferencesRec
+      '';
+
+  # Similar to the allowedReferences feature, but enforces that all of
+  # the references also use the allowReferencesRec feature, so all the
+  # references are followed on all paths in the tree.
+  allowReferencesRec = refs: drv:
+    lib.deepSeq (map (checkAR drv) refs)
+    lib.overrideDerivation drv (_: { allowedReferences = [ "out" ] ++ refs; allowedReferencesRec = 1; });
+
 
   # Build a dummy stdenv with no GCC, but with a dummy Glibc that is
   # good enough to compile our first GCC.
@@ -170,8 +186,10 @@ rec {
       coreutils = bootstrapTools;
       name = "bootstrap-gcc-wrapper";
     };
-    overrides = pkgs: {
+    overrides = pkgs: rec {
       inherit (stage1.pkgs) perl binutils paxctl;
+      linuxHeaders = allowReferencesRec [ ] pkgs.linuxHeaders;
+      glibc = allowReferencesRec [ linuxHeaders ] pkgs.glibc;
     };
   };
 
@@ -187,7 +205,7 @@ rec {
       coreutils = bootstrapTools;
       name = "bootstrap-gcc-wrapper";
     };
-    overrides = pkgs: {
+    overrides = pkgs: rec {
       inherit (stage2.pkgs) binutils glibc perl;
       # Link GCC statically against GMP etc.  This makes sense because
       # these builds of the libraries are only used by GCC, so it
@@ -198,6 +216,8 @@ rec {
       isl = pkgs.isl.override { stdenv = pkgs.makeStaticLibraries pkgs.stdenv; };
       cloog = pkgs.cloog.override { stdenv = pkgs.makeStaticLibraries pkgs.stdenv; };
       ppl = pkgs.ppl.override { stdenv = pkgs.makeStaticLibraries pkgs.stdenv; };
+      zlib = allowReferencesRec [ glibc ] pkgs.zlib;
+      gcc = pkgs.gcc.override (origWrap: { gcc = allowReferencesRec [ glibc zlib ] origWrap.gcc;});
     };
     extraAttrs = {
       glibc = stage2.pkgs.glibc;   # Required by gcc47 build
@@ -217,8 +237,39 @@ rec {
       name = "";
     };
     extraPath = [ stage3.pkgs.xz ];
-    overrides = pkgs: {
+    overrides = pkgs: rec {
       inherit (stage3.pkgs) gettext gnum4 gmp perl glibc;
+      gccPlain = stage4.stdenv.gcc.gcc;
+      # TODO: this is a bug here, should inherit zlib from stage3.pkgs
+      # instead because GCC is already using it.
+      zlib = allowReferencesRec [ glibc ] pkgs.zlib;
+      bash = allowReferencesRec [ glibc ] pkgs.bash;
+      paxctl = allowReferencesRec [ glibc ] pkgs.paxctl;
+      attr = allowReferencesRec [ glibc  ] pkgs.attr;
+      acl = allowReferencesRec [ glibc attr ] pkgs.acl;
+      binutils = allowReferencesRec [ glibc gccPlain zlib ] pkgs.binutils;
+      coreutils = allowReferencesRec [ glibc acl ] pkgs.coreutils;
+      pcre = allowReferencesRec [ glibc gccPlain ] pkgs.pcre;
+      gnugrep = allowReferencesRec [ glibc pcre ] pkgs.gnugrep;
+      gnutar = allowReferencesRec [ glibc ] pkgs.gnutar;
+      diffutils = allowReferencesRec [ glibc coreutils ] pkgs.diffutils;
+      gnupatch = allowReferencesRec [ glibc ed ] pkgs.gnupatch;
+      findutils = allowReferencesRec [ glibc coreutils ] pkgs.findutils;
+      libsigsegv = allowReferencesRec [ ] pkgs.libsigsegv;
+      gawk = allowReferencesRec [ glibc libsigsegv ] pkgs.gawk;
+      bzip2 = allowReferencesRec [ glibc ] pkgs.bzip2;
+      xz = allowReferencesRec [ glibc ] pkgs.xz;
+      gzip = allowReferencesRec [ glibc ] pkgs.gzip;
+      gnused = allowReferencesRec [ glibc ] pkgs.gnused;
+      patchelf = allowReferencesRec [ glibc gccPlain ] pkgs.patchelf;
+      gnumake = allowReferencesRec [ glibc ] pkgs.gnumake;
+      ed = allowReferencesRec [ glibc ] pkgs.ed;
+      gcc = allowReferencesRec [ binutils gccPlain bash glibc coreutils ] ((wrapGCC {
+        gcc = gccPlain;
+        libc = glibc;
+        inherit binutils coreutils;
+        name = "";
+      }).override { shell = bash + "/bin/bash"; });
     };
   };
 
@@ -230,7 +281,12 @@ rec {
   #    When updating stdenvLinux, make sure that the result has no
   #    dependency (`nix-store -qR') on bootstrapTools or the
   #    first binutils built.
-  stdenvLinux = import ../generic rec {
+  stdenvLinux = allowReferencesRec
+                (with stage4.pkgs;
+                    [ bash paxctl coreutils gnugrep diffutils gnutar
+                      patch findutils gawk bzip2 xz gcc
+                      gzip gnused ed patchelf gnumake
+                    ]) (import ../generic rec {
     inherit system config;
 
     preHook =
@@ -245,15 +301,9 @@ rec {
       ((import ../common-path.nix) {pkgs = stage4.pkgs;})
       ++ [stage4.pkgs.patchelf stage4.pkgs.paxctl ];
 
+    shell = stage4.pkgs.gcc.shell;
 
-    shell = stage4.pkgs.bash + "/bin/bash";
-
-    gcc = (wrapGCC {
-      gcc = stage4.stdenv.gcc.gcc;
-      libc = stage4.pkgs.glibc;
-      inherit (stage4.pkgs) binutils coreutils;
-      name = "";
-    }).override { inherit shell; };
+    gcc = stage4.pkgs.gcc;
 
     fetchurlBoot = stage4.stdenv.fetchurlBoot;
 
@@ -270,6 +320,5 @@ rec {
         glibc gnumake gnused gnutar gnugrep gnupatch patchelf
         attr acl paxctl;
     };
-  };
-
+  });
 }

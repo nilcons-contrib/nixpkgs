@@ -4626,7 +4626,7 @@ let
   glfw3 = callPackage ../development/libraries/glfw/3.x.nix { };
 
   glibc = callPackage ../development/libraries/glibc/2.19 {
-    kernelHeaders = linuxHeaders;
+    kernelHeaders = pkgs.linuxHeaders;
     installLocales = config.glibc.locales or false;
     machHeaders = null;
     hurdHeaders = null;
